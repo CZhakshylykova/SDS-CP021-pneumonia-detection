@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import matplotlib.pyplot as plt
-
+import kagglehub
 # ---- 1. SET SEED EVERYTHING FOR REPRODUCIBILITY ----
 def seed_everything(seed=42):
     random.seed(seed)
@@ -32,7 +32,12 @@ def seed_everything(seed=42):
 seed_everything(42)
 
 # ---- 2. CONFIG ----
-DATA_ROOT = "/Users/cholponzhakshylykova/Desktop/SDS/pytorch/chest_xray"
+# 2. Download the dataset using kagglehub
+dataset_dir = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
+DATA_ROOT = os.path.join(dataset_dir, "chest_xray")
+print("DATA_ROOT:", DATA_ROOT)
+
+DATA_ROOT = DATA_ROOT
 BATCH_SIZE = 32
 EPOCHS = 15
 PATIENCE = 4
@@ -46,6 +51,7 @@ for folder in [REPORTS_DIR, PLOTS_DIR]:
     os.makedirs(folder, exist_ok=True)
 
 # ---- 3. ADVANCED DATA AUGMENTATION ----
+
 class AlbumentationsTransform:
     def __init__(self, aug):
         self.aug = aug
@@ -53,6 +59,7 @@ class AlbumentationsTransform:
         return self.aug(image=np.array(img))['image']
 
 train_aug = A.Compose([
+    A.ToGray(p=1.0),
     A.Resize(IMG_SIZE, IMG_SIZE),
     A.HorizontalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
@@ -67,10 +74,12 @@ train_aug = A.Compose([
 ])
 
 val_aug = A.Compose([
+    A.ToGray(p=1.0),
     A.Resize(IMG_SIZE, IMG_SIZE),
     A.Normalize([0.5], [0.5]),
     ToTensorV2()
 ])
+
 
 # ---- 4. DATASET + OVERSAMPLING ----
 class OversampledDataset(Dataset):
@@ -310,4 +319,3 @@ if __name__ == "__main__":
     if grad_cam_available:
         gradcam_visualization(model, test_loader, device, out_dir=f"{PLOTS_DIR}/gradcam")
     print("\nAll metrics, plots, and reports are saved in 'plots/' and 'reports/' folders. Check TensorBoard logs in 'runs/chest_xray'.")
-
