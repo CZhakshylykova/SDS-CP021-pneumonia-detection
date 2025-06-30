@@ -1,0 +1,9 @@
+I am alive
+Epoch 1: Train Loss=0.1374, Acc=0.9480
+          Val Loss=0.1721, Acc=0.9375
+Epoch 2: Train Loss=0.0798, Acc=0.9706
+          Val Loss=0.2485, Acc=0.8750
+Epoch 3: Train Loss=0.0590, Acc=0.9797
+          Val Loss=0.2187, Acc=0.9375
+Epoch 4: Train Loss=0.0410, Acc=0.9850
+          Val Loss=0.1038, Acc=1.0000

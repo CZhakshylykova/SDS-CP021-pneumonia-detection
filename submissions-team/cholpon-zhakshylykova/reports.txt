@@ -1,0 +1,44 @@
+🫁 CHEST X-RAY PNEUMONIA DETECTION - EDA & PREPROCESSING
+======================================================================
+
+📊 ANALYZING DATASET DISTRIBUTION...
+============================================================
+DATASET DISTRIBUTION ANALYSIS
+============================================================
+
+TRAIN SET:
+      NORMAL:  1341 images (25.7%)
+   PNEUMONIA:  3875 images (74.3%)
+       TOTAL:  5216 images
+
+VAL SET:
+      NORMAL:     8 images (50.0%)
+   PNEUMONIA:     8 images (50.0%)
+       TOTAL:    16 images
+
+TEST SET:
+      NORMAL:   234 images (37.5%)
+   PNEUMONIA:   390 images (62.5%)
+       TOTAL:   624 images
+
+OVERALL DATASET:
+      NORMAL:  1583 images (27.0%)
+   PNEUMONIA:  4273 images (73.0%)
+       TOTAL:  5856 images
+
+CLASS IMBALANCE ANALYSIS & RECOMMENDATION:
+  TRAIN set imbalance ratio: 2.89 (max/min)
+  VAL set imbalance ratio: 1.00 (max/min)
+  TEST set imbalance ratio: 1.67 (max/min)
+  OVERALL imbalance ratio: 2.70 (max/min)
+
+Recommendation: There is a significant class imbalance.
+It is recommended to use OVERSAMPLING (or class weighting) during model training to address this.
+
+🎨 CREATING VISUALIZATIONS...
+
+🖼️  DISPLAYING SAMPLE IMAGES...
+
+🔄 DEMONSTRATING DATA AUGMENTATION...
+
+✅ PLOTS SAVED IN 'plots/' FOLDER, REPORTS SAVED IN 'reports.txt'.
