@@ -7,3 +7,5 @@ tuned_resnet50_model.tflite
 README.md
 .devcontainer
 .vscode
+.DS_Store
+venv/
