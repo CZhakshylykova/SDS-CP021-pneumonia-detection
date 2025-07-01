@@ -1,223 +1,323 @@
-"""
-Chest X-ray Pneumonia Detection: Exploratory Data Analysis & Data Preprocessing
-Dataset: https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia
-Author: Cholpon Zhakshylykova
-"""
-
 import os
 import random
-import warnings
 from pathlib import Path
-from typing import Dict
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from PIL import Image
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision import datasets, transforms
-
-
+from torchvision import datasets, models
+from PIL import Image
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_auc_score, roc_curve, auc, f1_score
+)
+from torch.utils.tensorboard import SummaryWriter
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import matplotlib.pyplot as plt
 import kagglehub
 
-# 2. Download the dataset using kagglehub
+# ---- 1. SET SEED EVERYTHING FOR REPRODUCIBILITY ----
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(42)
+
+# ---- 2. CONFIG ----
 dataset_dir = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
 DATA_ROOT = os.path.join(dataset_dir, "chest_xray")
 print("DATA_ROOT:", DATA_ROOT)
 
-# 3. Configuration
-warnings.filterwarnings("ignore")
-random.seed(42)
-torch.manual_seed(42)
-np.random.seed(42)
-plt.style.use('seaborn-v0_8')
-sns.set_palette("husl")
-os.makedirs("plots", exist_ok=True)
+BATCH_SIZE = 32
+EPOCHS = 15
+PATIENCE = 4
+IMG_SIZE = 128
+NUM_CLASSES = 2
+LOG_DIR = "runs/chest_xray"
+REPORTS_DIR = "reports"
+PLOTS_DIR = "plots"
 
-class ChestXrayEDA:
-    """Comprehensive EDA class for Chest X-ray Pneumonia dataset"""
-    def __init__(self, data_root: str):
-        self.data_root = Path(data_root)
-        self.splits = ['train', 'val', 'test']
-        self.classes = ['NORMAL', 'PNEUMONIA']
-        self.dataset_stats = {}
-        self._validate_dataset_structure()
-    def _validate_dataset_structure(self):
-        if not self.data_root.exists():
-            raise FileNotFoundError(f"Dataset root not found: {self.data_root}")
-        for split in self.splits:
-            split_path = self.data_root / split
-            if not split_path.exists():
-                raise FileNotFoundError(f"Split directory not found: {split_path}")
-            for cls in self.classes:
-                class_path = split_path / cls
-                if not class_path.exists():
-                    raise FileNotFoundError(f"Class directory not found: {class_path}")
-    def analyze_dataset_distribution(self) -> Dict:
-        stats = {}
-        for split in self.splits:
-            stats[split] = {}
-            split_path = self.data_root / split
-            for cls in self.classes:
-                class_path = split_path / cls
-                image_files = [f for f in class_path.iterdir() if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
-                stats[split][cls] = len(image_files)
-            stats[split]['total'] = sum(stats[split].values())
-        self.dataset_stats = stats
+for folder in [REPORTS_DIR, PLOTS_DIR]:
+    os.makedirs(folder, exist_ok=True)
 
-        print("="*60)
-        print("DATASET DISTRIBUTION ANALYSIS")
-        print("="*60)
-        for split in self.splits:
-            print(f"\n{split.upper()} SET:")
-            for cls in self.classes:
-                count = stats[split][cls]
-                percentage = (count / stats[split]['total']) * 100
-                print(f"  {cls:>10}: {count:>5} images ({percentage:.1f}%)")
-            print(f"  {'TOTAL':>10}: {stats[split]['total']:>5} images")
-        total_images = sum(stats[split]['total'] for split in self.splits)
-        total_normal = sum(stats[split]['NORMAL'] for split in self.splits)
-        total_pneumonia = sum(stats[split]['PNEUMONIA'] for split in self.splits)
-        print(f"\nOVERALL DATASET:")
-        print(f"  {'NORMAL':>10}: {total_normal:>5} images ({(total_normal/total_images)*100:.1f}%)")
-        print(f"  {'PNEUMONIA':>10}: {total_pneumonia:>5} images ({(total_pneumonia/total_images)*100:.1f}%)")
-        print(f"  {'TOTAL':>10}: {total_images:>5} images")
-        # Assess class imbalance and recommend oversampling if needed
-        imbalance_info = []
-        imbalance_threshold = 1.2
-        for split in self.splits:
-            n_normal = stats[split]['NORMAL']
-            n_pneumonia = stats[split]['PNEUMONIA']
-            ratio = max(n_normal, n_pneumonia) / (min(n_normal, n_pneumonia) + 1e-9)
-            imbalance_info.append((split, ratio))
-        overall_ratio = max(total_normal, total_pneumonia) / (min(total_normal, total_pneumonia) + 1e-9)
-        print("\nCLASS IMBALANCE ANALYSIS & RECOMMENDATION:")
-        for split, ratio in imbalance_info:
-            print(f"  {split.upper()} set imbalance ratio: {ratio:.2f} (max/min)")
-        print(f"  OVERALL imbalance ratio: {overall_ratio:.2f} (max/min)")
-        if overall_ratio > imbalance_threshold:
-            print("\nRecommendation: There is a significant class imbalance.")
-            print("It is recommended to use OVERSAMPLING (or class weighting) during model training to address this.")
+# ---- 3. ADVANCED DATA AUGMENTATION ----
+
+def to_1ch(x, **kwargs):
+    # If the image has shape (H, W, 3), pick the first channel only
+    if x.shape[-1] == 3:
+        x = x[..., 0:1]
+    return x
+
+class AlbumentationsTransform:
+    def __init__(self, aug):
+        self.aug = aug
+    def __call__(self, img):
+        return self.aug(image=np.array(img))['image']
+
+train_aug = A.Compose([
+    A.ToGray(p=1.0),
+    A.Lambda(image=to_1ch),
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.Rotate(limit=15, p=0.5),
+    A.RandomBrightnessContrast(p=0.2),
+    A.OneOf([
+        A.GaussianBlur(p=0.5),
+        A.MotionBlur(p=0.5)
+    ], p=0.2),
+    A.Normalize([0.5], [0.5]),
+    ToTensorV2()
+])
+
+val_aug = A.Compose([
+    A.ToGray(p=1.0),
+    A.Lambda(image=to_1ch),     # Fix for validation/test transforms!
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.Normalize([0.5], [0.5]),
+    ToTensorV2()
+])
+
+# ---- 4. DATASET + OVERSAMPLING ----
+class OversampledDataset(Dataset):
+    def __init__(self, normal_files, pneumonia_files, transform=None):
+        n_normal, n_pneumonia = len(normal_files), len(pneumonia_files)
+        if n_normal < n_pneumonia:
+            normal_files = normal_files * (n_pneumonia // n_normal) + random.sample(normal_files, n_pneumonia % n_normal)
+        elif n_pneumonia < n_normal:
+            pneumonia_files = pneumonia_files * (n_normal // n_pneumonia) + random.sample(pneumonia_files, n_normal % n_pneumonia)
+        self.images = normal_files + pneumonia_files
+        self.labels = [0]*len(normal_files) + [1]*len(pneumonia_files)
+        self.transform = transform
+
+    def __len__(self): return len(self.images)
+    def __getitem__(self, idx):
+        img = Image.open(self.images[idx]).convert('L')
+        if self.transform: img = self.transform(img)
+        return img, self.labels[idx]
+
+def get_dataloaders(data_root, batch_size=32):
+    train_normal = list((Path(data_root) / 'train' / 'NORMAL').glob('*.jpg')) + list((Path(data_root) / 'train' / 'NORMAL').glob('*.jpeg'))
+    train_pneu = list((Path(data_root) / 'train' / 'PNEUMONIA').glob('*.jpg')) + list((Path(data_root) / 'train' / 'PNEUMONIA').glob('*.jpeg'))
+
+    train_dataset = OversampledDataset(
+        [str(x) for x in train_normal],
+        [str(x) for x in train_pneu],
+        transform=AlbumentationsTransform(train_aug)
+    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    val_dataset = datasets.ImageFolder(Path(data_root) / 'val',
+                                      transform=AlbumentationsTransform(val_aug))
+    test_dataset = datasets.ImageFolder(Path(data_root) / 'test',
+                                       transform=AlbumentationsTransform(val_aug))
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
+
+# ---- 5. MODEL & FINE-TUNING ----
+def get_model():
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+    return model
+
+# ---- 6. TRAINING LOOP w/ EARLY STOPPING, SCHEDULER, MIXED PRECISION, METRICS ----
+def plot_metrics(train_hist, val_hist, name):
+    plt.figure(figsize=(7,5))
+    plt.plot(train_hist, label='Train')
+    plt.plot(val_hist, label='Val')
+    plt.xlabel('Epoch')
+    plt.ylabel(name)
+    plt.legend()
+    plt.title(f'{name} curve')
+    plt.savefig(f"{PLOTS_DIR}/{name.lower()}_curve.png")
+    plt.close()
+
+def train_model(model, train_loader, val_loader, device, epochs=10, patience=3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.5)
+    # Weighted loss for imbalance
+    class_counts = [0, 0]
+    for imgs, lbls in train_loader:
+        for l in lbls:
+            class_counts[l] += 1
+    weights = torch.FloatTensor([1/c if c>0 else 1 for c in class_counts]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
+    writer = SummaryWriter(LOG_DIR)
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+
+    best_acc, patience_cnt = 0, 0
+    train_losses, val_losses, train_accs, val_accs = [], [], [], []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss, correct, total = 0, 0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), torch.tensor(labels).to(device)
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast(enabled=scaler is not None):
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            train_loss += loss.item() * imgs.size(0)
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+        avg_loss = train_loss / total
+        acc = correct / total
+        train_losses.append(avg_loss)
+        train_accs.append(acc)
+        writer.add_scalar("Loss/Train", avg_loss, epoch)
+        writer.add_scalar("Acc/Train", acc, epoch)
+
+        # ---- VALIDATION ----
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        all_val_preds, all_val_labels, all_val_probs = [], [], []
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                probs = torch.softmax(outputs, dim=1)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * imgs.size(0)
+                preds = outputs.argmax(1)
+                val_correct += (preds == labels).sum().item()
+                val_total += labels.size(0)
+                all_val_preds.extend(preds.cpu().numpy())
+                all_val_labels.extend(labels.cpu().numpy())
+                all_val_probs.extend(probs[:,1].cpu().numpy())
+        val_acc = val_correct / val_total
+        avg_val_loss = val_loss / val_total
+        val_losses.append(avg_val_loss)
+        val_accs.append(val_acc)
+        writer.add_scalar("Loss/Val", avg_val_loss, epoch)
+        writer.add_scalar("Acc/Val", val_acc, epoch)
+
+        val_f1 = f1_score(all_val_labels, all_val_preds)
+        val_auc = roc_auc_score(all_val_labels, all_val_probs)
+        writer.add_scalar("AUC/Val", val_auc, epoch)
+        writer.add_scalar("F1/Val", val_f1, epoch)
+        print(f"Epoch {epoch+1}: Train Loss={avg_loss:.4f}, Acc={acc:.4f} | Val Loss={avg_val_loss:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}, AUC={val_auc:.4f}")
+
+        # Learning rate scheduler
+        scheduler.step(val_acc)
+
+        # ---- EARLY STOPPING ----
+        if val_acc > best_acc:
+            best_acc = val_acc
+            patience_cnt = 0
+            torch.save(model.state_dict(), "best_model.pth")
         else:
-            print("\nNo significant class imbalance detected.")
-        return stats
-    def visualize_distribution(self):
-        if not self.dataset_stats:
-            self.analyze_dataset_distribution()
-        splits = list(self.dataset_stats.keys())
-        normal_counts = [self.dataset_stats[split]['NORMAL'] for split in splits]
-        pneumonia_counts = [self.dataset_stats[split]['PNEUMONIA'] for split in splits]
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        x = np.arange(len(splits))
-        width = 0.6
-        axes[0, 0].bar(x, normal_counts, width, label='NORMAL', alpha=0.8)
-        axes[0, 0].bar(x, pneumonia_counts, width, bottom=normal_counts, label='PNEUMONIA', alpha=0.8)
-        axes[0, 0].set_xlabel('Dataset Split')
-        axes[0, 0].set_ylabel('Number of Images')
-        axes[0, 0].set_title('Dataset Distribution by Split')
-        axes[0, 0].set_xticks(x)
-        axes[0, 0].set_xticklabels([s.capitalize() for s in splits])
-        axes[0, 0].legend()
-        axes[0, 0].grid(axis='y', alpha=0.3)
-        width = 0.35
-        axes[0, 1].bar(x - width/2, normal_counts, width, label='NORMAL', alpha=0.8)
-        axes[0, 1].bar(x + width/2, pneumonia_counts, width, label='PNEUMONIA', alpha=0.8)
-        axes[0, 1].set_xlabel('Dataset Split')
-        axes[0, 1].set_ylabel('Number of Images')
-        axes[0, 1].set_title('Class Distribution Comparison')
-        axes[0, 1].set_xticks(x)
-        axes[0, 1].set_xticklabels([s.capitalize() for s in splits])
-        axes[0, 1].legend()
-        axes[0, 1].grid(axis='y', alpha=0.3)
-        total_normal = sum(normal_counts)
-        total_pneumonia = sum(pneumonia_counts)
-        axes[1, 0].pie([total_normal, total_pneumonia], labels=['NORMAL', 'PNEUMONIA'],
-                       autopct='%1.1f%%', startangle=90, colors=['lightblue', 'lightcoral'])
-        axes[1, 0].set_title('Overall Class Distribution')
-        imbalance_ratios = []
-        split_labels = []
-        for split in splits:
-            normal = self.dataset_stats[split]['NORMAL']
-            pneumonia = self.dataset_stats[split]['PNEUMONIA']
-            ratio = pneumonia / normal if normal > 0 else 0
-            imbalance_ratios.append(ratio)
-            split_labels.append(f"{split.capitalize()}\n({pneumonia}:{normal})")
-        bars = axes[1, 1].bar(range(len(splits)), imbalance_ratios, alpha=0.8)
-        axes[1, 1].set_xlabel('Dataset Split')
-        axes[1, 1].set_ylabel('Pneumonia:Normal Ratio')
-        axes[1, 1].set_title('Class Imbalance by Split')
-        axes[1, 1].set_xticks(range(len(splits)))
-        axes[1, 1].set_xticklabels(split_labels)
-        axes[1, 1].axhline(y=1, color='red', linestyle='--', alpha=0.7, label='Balanced')
-        axes[1, 1].legend()
-        axes[1, 1].grid(axis='y', alpha=0.3)
-        for i, (bar, ratio) in enumerate(zip(bars, imbalance_ratios)):
-            axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                            f'{ratio:.2f}', ha='center', va='bottom')
-        plt.tight_layout()
-        fig.savefig(os.path.join("plots", "dataset_distribution.png"))
-        plt.close(fig)
-    def sample_images_visualization(self, n_samples: int = 8):
-        fig, axes = plt.subplots(2, n_samples, figsize=(20, 8))
-        for class_idx, class_name in enumerate(self.classes):
-            class_path = self.data_root / 'train' / class_name
-            image_files = list(class_path.glob('*.jpeg')) + list(class_path.glob('*.jpg'))
-            sampled_files = random.sample(image_files, min(n_samples, len(image_files)))
-            for img_idx, img_path in enumerate(sampled_files):
-                try:
-                    img = Image.open(img_path).convert('L')
-                    axes[class_idx, img_idx].imshow(img, cmap='gray')
-                    axes[class_idx, img_idx].set_title(f'{class_name}\n{img_path.name}')
-                    axes[class_idx, img_idx].axis('off')
-                except Exception as e:
-                    axes[class_idx, img_idx].text(0.5, 0.5, f'Error loading\n{img_path.name}',
-                                                 ha='center', va='center', transform=axes[class_idx, img_idx].transAxes)
-                    axes[class_idx, img_idx].axis('off')
-        plt.suptitle('Sample Images from Each Class', fontsize=16)
-        plt.tight_layout()
-        fig.savefig(os.path.join("plots", "sample_images.png"))
-        plt.close(fig)
+            patience_cnt += 1
+            if patience_cnt >= patience:
+                print("Early stopping triggered.")
+                break
 
-def visualize_augmentations(data_root: str, n_augmentations: int = 5):
-    transform_augment = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-        transforms.ToTensor(),
-    ])
-    sample_path = Path(data_root) / 'train' / 'PNEUMONIA'
-    sample_files = list(sample_path.glob('*.jpeg')) + list(sample_path.glob('*.jpg'))
-    sample_img_path = random.choice(sample_files)
-    original_img = Image.open(sample_img_path).convert('L')
-    fig, axes = plt.subplots(1, n_augmentations + 1, figsize=(20, 4))
-    axes[0].imshow(original_img, cmap='gray')
-    axes[0].set_title('Original')
-    axes[0].axis('off')
-    for i in range(n_augmentations):
-        augmented = transform_augment(original_img)
-        axes[i + 1].imshow(augmented.squeeze(), cmap='gray')
-        axes[i + 1].set_title(f'Augmented {i + 1}')
-        axes[i + 1].axis('off')
-    plt.suptitle(f'Data Augmentation Examples - {sample_img_path.name}', fontsize=14)
-    plt.tight_layout()
-    fig.savefig(os.path.join("plots", "data_augmentation.png"))
-    plt.close(fig)
+    plot_metrics(train_losses, val_losses, "Loss")
+    plot_metrics(train_accs, val_accs, "Accuracy")
+    writer.close()
+    print("Best val accuracy: %.4f" % best_acc)
+    return model
 
-def main():
-    print("🫁 CHEST X-RAY PNEUMONIA DETECTION - EDA & PREPROCESSING")
-    print("=" * 70)
-    eda = ChestXrayEDA(DATA_ROOT)
-    print("\n📊 ANALYZING DATASET DISTRIBUTION...")
-    eda.analyze_dataset_distribution()
-    print("\n🎨 CREATING VISUALIZATIONS...")
-    eda.visualize_distribution()
-    print("\n🖼️  DISPLAYING SAMPLE IMAGES...")
-    eda.sample_images_visualization()
-    print("\n🔄 DEMONSTRATING DATA AUGMENTATION...")
-    visualize_augmentations(DATA_ROOT)
-    print("\n✅ PLOTS SAVED IN 'plots/' FOLDER.")
+# ---- 7. EVALUATION (Validation/Test set): ROC, AUC, F1, confusion matrix ----
+def plot_roc_curve(y_true, y_probs, filename):
+    fpr, tpr, _ = roc_curve(y_true, y_probs)
+    auc_val = auc(fpr, tpr)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f"ROC curve (AUC = {auc_val:.2f})")
+    plt.plot([0, 1], [0, 1], "k--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Receiver operating characteristic")
+    plt.legend(loc="lower right")
+    plt.savefig(filename)
+    plt.close()
 
+def eval_model(model, data_loader, device, split="Test"):
+    model.eval()
+    test_correct, test_total = 0, 0
+    all_preds, all_labels, all_probs = [], [], []
+    with torch.no_grad():
+        for imgs, labels in data_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            probs = torch.softmax(outputs, dim=1)
+            preds = outputs.argmax(1)
+            test_correct += (preds == labels).sum().item()
+            test_total += labels.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs[:,1].cpu().numpy())
+    acc = test_correct / test_total
+    f1 = f1_score(all_labels, all_preds)
+    auc_val = roc_auc_score(all_labels, all_probs)
+    cm = confusion_matrix(all_labels, all_preds)
+    cr = classification_report(all_labels, all_preds, target_names=['NORMAL', 'PNEUMONIA'])
+    plot_roc_curve(all_labels, all_probs, f"{PLOTS_DIR}/roc_{split.lower()}.png")
+    print(f"{split} accuracy: {acc:.4f} | F1: {f1:.4f} | AUC: {auc_val:.4f}")
+    print(f"{split} Confusion matrix:\n{cm}")
+    print(f"{split} Classification report:\n{cr}")
+    # Save report
+    with open(f"{REPORTS_DIR}/{split.lower()}_report.txt", "w") as f:
+        f.write(f"{split} accuracy: {acc:.4f} | F1: {f1:.4f} | AUC: {auc_val:.4f}\n")
+        f.write(f"{split} Confusion matrix:\n{cm}\n")
+        f.write(f"{split} Classification report:\n{cr}\n")
+    return acc, f1, auc_val
+
+# ---- 8. OPTIONAL: Grad-CAM Visualizations for explainability ----
+try:
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    grad_cam_available = True
+except ImportError:
+    grad_cam_available = False
+
+def gradcam_visualization(model, data_loader, device, out_dir):
+    if not grad_cam_available:
+        print("Grad-CAM is not installed. Skipping CAM visualizations.")
+        return
+    model.eval()
+    target_layers = [model.layer4[-1]]
+    cam = GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type=='cuda'))
+    os.makedirs(out_dir, exist_ok=True)
+    for batch_idx, (imgs, labels) in enumerate(data_loader):
+        imgs = imgs.to(device)
+        grayscale_cam = cam(input_tensor=imgs, targets=None)
+        for i in range(imgs.shape[0]):
+            img = imgs[i].detach().cpu().numpy().transpose(1,2,0)
+            img_norm = (img - img.min()) / (img.max() - img.min())
+            cam_img = show_cam_on_image(img_norm, grayscale_cam[i], use_rgb=True)
+            plt.imsave(f"{out_dir}/cam_{batch_idx}_{i}.png", cam_img)
+        if batch_idx > 1:  # Only process a couple batches for demo
+            break
+
+# ---- 9. MAIN ----
 if __name__ == "__main__":
-    main()
-
+    print("I am alive")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_loader, val_loader, test_loader = get_dataloaders(DATA_ROOT, batch_size=BATCH_SIZE)
+    model = get_model()
+    model = train_model(model, train_loader, val_loader, device, epochs=EPOCHS, patience=PATIENCE)
+    # Load best model before test
+    model.load_state_dict(torch.load("best_model.pth"))
+    print("\n--- Validation Set Performance ---")
+    eval_model(model, val_loader, device, split="Validation")
+    print("\n--- Test Set Performance ---")
+    eval_model(model, test_loader, device, split="Test")
+    # Grad-CAM visualizations
+    if grad_cam_available:
+        gradcam_visualization(model, test_loader, device, out_dir=f"{PLOTS_DIR}/gradcam")
+    print("\nAll metrics, plots, and reports are saved in 'plots/' and 'reports/' folders. Check TensorBoard logs in 'runs/chest_xray'.")
