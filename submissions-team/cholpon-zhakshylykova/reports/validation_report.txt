@@ -1,0 +1,14 @@
+Validation accuracy: 1.0000 | F1: 1.0000 | AUC: 1.0000
+Validation Confusion matrix:
+[[8 0]
+ [0 8]]
+Validation Classification report:
+              precision    recall  f1-score   support
+
+      NORMAL       1.00      1.00      1.00         8
+   PNEUMONIA       1.00      1.00      1.00         8
+
+    accuracy                           1.00        16
+   macro avg       1.00      1.00      1.00        16
+weighted avg       1.00      1.00      1.00        16
+
